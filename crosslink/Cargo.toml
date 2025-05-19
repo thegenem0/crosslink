@@ -1,0 +1,12 @@
+[package]
+name = "crosslink"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crosslink-macros = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+
+[examples]
+ping_pong = "ping_pong"

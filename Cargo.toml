@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [ "crosslink", "crosslink-macros" ]
+
+[workspace.dependencies]
+crosslink-macros = { path = "crosslink-macros" }
+
+tokio = "1.45.0"
+proc-macro2 = "1.0.95"
+quote = "1.0.40"
+strum = "0.27.1"
+strum_macros = "0.27.1"
+syn = "2.0.101"
+thiserror = "2.0.12"
