@@ -1,88 +1,111 @@
 //! # Crosslink
 //!
-//! A typed, asynchronous communication framework for Rust applications,
-//! enabling clear and robust inter-component messaging.
+//! Typed, asynchronous communication channels for Rust, built on Tokio MPSC.
 //!
-//! ## Features
+//! Crosslink uses a procedural macro (`define_crosslink!`) to generate type-safe
+//! communication links, managed by a central `Router`. This provides a clear and
+//! robust way to handle inter-component messaging.
 //!
-//! - **Type-Safe Links:** Define communication links between components with explicit message types.
-//! - **Centralized Commander:** A single `Commander` instance dispatches messages, simplifying dependencies.
-//! - **Procedural Macro Setup:** The `define_links!` macro generates boilerplate for link definitions,
-//!   enum keys, and typed receiver handles.
-//! - **Asynchronous:** Built on `tokio` MPSC channels.
+//! ## Quick Start
 //!
-//! ## Usage
+//! ```rust
+//! use crosslink::{Router, define_crosslink, CommsError};
+//! use std::sync::Arc;
+//! use tokio::time::{sleep, Duration};
 //!
-//! ```rust,ignore
-//! // Define your message types
+//! // 1. Define your message types
 //! #[derive(Debug, Clone)]
-//! struct PingMsg(String);
+//! pub struct Ping(u32);
+//! // Ensure types satisfy Crosslink's internal trait bounds:
+//! // For sending: Send + Sync + 'static + Debug + Clone
+//! // For receiving: Send + 'static + Debug
+//! impl crosslink::sender::ConcreteSenderTrait for Ping {}
+//! impl crosslink::receiver::ConcreteReceiverMessageTrait for Ping {}
+//!
 //! #[derive(Debug, Clone)]
-//! struct PongMsg(String);
+//! pub struct Pong(u32);
+//! impl crosslink::sender::ConcreteSenderTrait for Pong {}
+//! impl crosslink::receiver::ConcreteReceiverMessageTrait for Pong {}
 //!
-//! // Use the define_links! macro to set up communication
-//! crosslink::define_links! {
-//!     enum AppLinkKeys;  // Name for your link ID enum
-//!     struct AppHandles; // Name for the struct holding receiver handles
-//!
-//!     links {
-//!         PingerToPonger: bi_directional (
-//!             ep1 ( name: PingerHandle, sends: PingMsg, receives: PongMsg ),
-//!             ep2 ( name: PongerHandle ), // Message types inferred from ep1
-//!             buffer: 16,
-//!         ),
-//!     }
+//! // 2. Define the link using the macro (typically at module level)
+//! // This generates:
+//! // - `pub mod ping_pong { ... }` containing marker types and setup function.
+//! // - Marker types like `ping_pong::marker::PingerSenderMarker`.
+//! // - Setup function `ping_pong::setup_ping_pong_link(...)`.
+//! define_crosslink! {
+//!     link_id_prefix: PingPong, // Forms module `ping_pong` & func `setup_ping_pong`
+//!     Pinger { sends: Ping, receives: Pong }, // Defines `ping_pong::Pinger` (nominal)
+//!     Ponger { sends: Pong, receives: Ping }, // Defines `ping_pong::Ponger` (nominal)
+//!     buffer_size: 8,
 //! }
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // The macro expands to an expression returning (Commander, AppHandles)
-//!     let (commander, mut handles) = crosslink::define_links! { /* ... as above ... */ };
-//!     let commander = std::sync::Arc::new(commander);
+//!     // 3. Setup Router
+//!     let mut router = Router::new();
+//!     // Call the generated setup function for the link
+//!     ping_pong::setup_ping_pong(&mut router, Some(8)); // buffer_override
 //!
-//!     let pinger_commander = commander.clone();
-//!     let mut pinger_handle = handles.pinger_to_ponger_pinger_handle; // Generated field name
+//!     let shared_router = Arc::new(router);
 //!
+//!     // 4. Pinger Task
+//!     let pinger_router = Arc::clone(&shared_router);
 //!     tokio::spawn(async move {
-//!         let ping = PingMsg("hello".to_string());
-//!         println!("[Pinger] Sending: {:?}", ping);
-//!         pinger_commander.send(AppLinkKeys::PingerToPonger, ping).await.unwrap();
+//!         // Obtain receiver using the generated marker and expected message type
+//!         let mut pinger_rx = pinger_router
+//!             .take_receiver::<ping_pong::marker::PingPongPingerReceiverMarker, Pong>()
+//!             .expect("Pinger: Failed to take Pong receiver");
 //!
-//!         if let Some(pong) = pinger_handle.recv().await {
-//!             println!("[Pinger] Received: {:?}", pong);
+//!         for i in 0..2 {
+//!             let msg = Ping(i);
+//!             println!("[Pinger] Sending: {:?}", msg);
+//!             // Send using the corresponding sender marker and message type
+//!             if let Err(e) = pinger_router.send::<ping_pong::marker::PingPongPingerSenderMarker, _>(msg).await {
+//!                 eprintln!("[Pinger] Send error: {}", e); return;
+//!             }
+//!
+//!             if let Some(pong_msg) = pinger_rx.recv().await {
+//!                 println!("[Pinger] Received: {:?}", pong_msg);
+//!             } else {
+//!                 println!("[Pinger] Ponger disconnected."); return;
+//!             }
 //!         }
 //!     });
 //!
-//!     let ponger_commander = commander.clone();
-//!     let mut ponger_handle = handles.pinger_to_ponger_ponger_handle;
-//!
+//!     // 5. Ponger Task
+//!     let ponger_router = Arc::clone(&shared_router);
 //!     tokio::spawn(async move {
-//!         if let Some(ping) = ponger_handle.recv().await {
-//!             println!("[Ponger] Received: {:?}", ping);
-//!             let pong = PongMsg(format!("ack to {}", ping.0));
-//!             println!("[Ponger] Sending: {:?}", pong);
-//!             ponger_commander.send(AppLinkKeys::PingerToPonger, pong).await.unwrap();
+//!         let mut ponger_rx = ponger_router
+//!             .take_receiver::<ping_pong::marker::PingPongPongerReceiverMarker, Ping>()
+//!             .expect("Ponger: Failed to take Ping receiver");
+//!
+//!         while let Some(ping_msg) = ponger_rx.recv().await {
+//!             println!("[Ponger] Received: {:?}", ping_msg);
+//!             let reply = Pong(ping_msg.0); // Respond with Pong
+//!             println!("[Ponger] Sending: {:?}", reply);
+//!             if let Err(e) = ponger_router.send::<ping_pong::marker::PingPongPongerSenderMarker, _>(reply).await {
+//!                 eprintln!("[Ponger] Send error: {}", e); return;
+//!             }
 //!         }
+//!         println!("[Ponger] Pinger disconnected.");
 //!     });
 //!
-//!     // Keep main alive for a bit for tasks to run
-//!     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+//!     sleep(Duration::from_millis(500)).await; // Allow tasks to run
 //!     Ok(())
 //! }
 //! ```
-//! (Note: The above example needs to be placed where `define_links!` is accessible,
-//!  typically in user code, not library documentation directly if macro pathing is an issue.)
-
-// Re-export the procedural macro from the crosslink-macros crate
-pub use crosslink_macros::define_links;
-
-// Potentially re-export strum for users if they need to interact with AsRefStr more directly,
-// though it's mainly an internal detail for the macro and Commander.
-// pub use strum;
+//!
+//! The `define_crosslink!` macro handles the generation of necessary types and
+//! a setup function for each link, which configures your central `Router`.
+//! You then use the `Router` with generated marker types for type-safe message
+//! sending and receiver acquisition.
 
 pub mod error;
+pub mod receiver;
 pub mod router;
 pub mod sender;
 
 pub use error::CommsError;
-pub use router::{InternalDispatchKey, Router, TypeToPathwayMapping};
+pub use router::Router;
+
+pub use crosslink_macros::define_crosslink;

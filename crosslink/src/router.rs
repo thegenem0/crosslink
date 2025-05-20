@@ -1,34 +1,23 @@
-use std::{any::TypeId, collections::HashMap, fmt::Debug};
+use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
+    fmt::Debug,
+    sync::Mutex,
+};
 
 use tokio::sync::mpsc;
 
 use crate::{
     error::CommsError,
-    sender::{ConcreteSender, DynSender},
+    receiver::{ConcreteReceiver, ConcreteReceiverTrait, DynReceiver},
+    sender::{ConcreteSender, ConcreteSenderTrait, DynSender},
 };
 
-/// Uniquely identifies a specific directed pathway within the Commander.
-/// Format: "UserLinkEnumVariantName/FromStructName_to_ToStructName"
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct InternalDispatchKey(pub String); // Made pub for potential advanced usage/debugging
-
-/// Maps a message type to a specific internal pathway for a given user link.
-#[derive(Debug)]
-pub struct TypeToPathwayMapping {
-    pub msg_type_id: TypeId,
-    pub msg_type_name: &'static str,
-    /// The full InternalDispatchKey to use for this type on this link.
-    pub pathway_key_to_use: InternalDispatchKey,
-}
-
 #[derive(Debug, Default)]
+#[allow(clippy::type_complexity)]
 pub struct Router {
-    /// Stores the actual senders, keyed by their full internal pathway.
-    pathway_senders: HashMap<InternalDispatchKey, Box<dyn DynSender>>,
-    /// Maps a user-facing link ID (string version of the enum variant) to a list of
-    /// message types it can send and their corresponding internal pathways.
-    /// Key: String representation of the Link Enum variant (e.g., "CoordinatorToLauncher").
-    link_id_to_type_dispatch_info: HashMap<String, Vec<TypeToPathwayMapping>>,
+    typed_senders: HashMap<TypeId, Box<dyn DynSender>>,
+    typed_receivers: HashMap<TypeId, (TypeId, Mutex<Option<Box<dyn DynReceiver>>>)>,
 }
 
 impl Router {
@@ -36,122 +25,133 @@ impl Router {
         Default::default()
     }
 
-    /// Internal method called by the setup macro to register a communication pathway
-    /// and its association with a message type for a given link ID.
-    /// **This method is intended for use by the `define_links!` macro only.**
-    #[doc(hidden)]
-    pub fn __internal_register_pathway_and_type_mapping<Msg>(
+    pub fn __internal_register_sender<SenderMarker, Msg>(
         &mut self,
-        link_id_variant_name_str: &str, // String representation of the Link Enum variant
-        source_struct_name_str: &str,   // Name of the sending handle struct
-        target_struct_name_str: &str,   // Name of the receiving handle struct
         sender: mpsc::Sender<Msg>,
     ) -> Result<(), CommsError>
     where
-        Msg: Send + Sync + 'static + Debug + Clone,
+        SenderMarker: Any + Send + Sync + 'static,
+        Msg: ConcreteSenderTrait,
     {
-        let internal_pathway_key_str = format!(
-            "{}/{}_to_{}",
-            link_id_variant_name_str, source_struct_name_str, target_struct_name_str
-        );
-        let internal_key = InternalDispatchKey(internal_pathway_key_str.clone());
+        let marker_type_id = TypeId::of::<SenderMarker>();
 
-        // 1. Register the actual sender endpoint
-        if self.pathway_senders.contains_key(&internal_key) {
-            return Err(CommsError::PathwayAlreadyRegistered(
-                internal_pathway_key_str,
-            ));
-        }
-        self.pathway_senders.insert(
-            internal_key.clone(),
-            Box::new(ConcreteSender {
-                sender,
-                _marker: std::marker::PhantomData,
-            }),
-        );
-
-        // 2. Register the mapping from (link_id_variant_name, message_type) to internal_key
-        let type_mappings = self
-            .link_id_to_type_dispatch_info
-            .entry(link_id_variant_name_str.to_string())
-            .or_default();
-
-        let msg_type_id = TypeId::of::<Msg>();
-        if type_mappings.iter().any(|tm| tm.msg_type_id == msg_type_id) {
-            return Err(CommsError::MessageTypeNotMappedForLink(format!(
-                "Message type '{}' is already mapped for link '{}' (pathway: {}). 
-                Ambiguous for type-based dispatch on this link. 
-                Each (link_id, message_type) pair must uniquely identify one pathway.",
-                std::any::type_name::<Msg>(),
-                link_id_variant_name_str,
-                internal_pathway_key_str
+        if self.typed_senders.contains_key(&marker_type_id) {
+            return Err(CommsError::PathwayAlreadyRegistered(format!(
+                "Sender for marker type '{}' already registered.",
+                std::any::type_name::<SenderMarker>()
             )));
         }
 
-        type_mappings.push(TypeToPathwayMapping {
-            msg_type_id,
-            msg_type_name: std::any::type_name::<Msg>(),
-            pathway_key_to_use: internal_key,
-        });
+        self.typed_senders
+            .insert(marker_type_id, Box::new(ConcreteSender { sender }));
 
         Ok(())
     }
 
-    /// Sends a message on a specified link. The Commander infers the exact
-    /// pathway (direction/target) based on the message's type.
-    ///
-    /// `LKey` is expected to be the macro-generated enum for link IDs.
-    /// It must implement `AsRef<str>` (e.g., via `strum_macros::AsRefStr`).
-    pub async fn send<LKey, Message>(
-        &self,
-        link_key: LKey,
-        message: Message,
+    pub fn __internal_register_receiver<ReceiverMarker, Msg>(
+        &mut self,
+        receiver: mpsc::Receiver<Msg>, // Receiver for the owning end of the pathway
     ) -> Result<(), CommsError>
     where
-        LKey: AsRef<str> + Copy + Debug, // `AsRef<str>` gets "VariantName" from LKey::VariantName
-        Message: Send + Sync + 'static + Debug + Clone,
+        ReceiverMarker: Any + Send + Sync + 'static,
+        Msg: ConcreteReceiverTrait,
     {
-        let link_id_str = link_key.as_ref();
-        let msg_type_id_to_send = TypeId::of::<Message>();
-        let msg_type_name_to_send = std::any::type_name::<Message>();
+        let marker_type_id = TypeId::of::<ReceiverMarker>();
+        if self.typed_receivers.contains_key(&marker_type_id) {
+            return Err(CommsError::PathwayAlreadyRegistered(format!(
+                "Receiver for marker type '{}' already registered.",
+                std::any::type_name::<ReceiverMarker>()
+            )));
+        }
 
-        match self.link_id_to_type_dispatch_info.get(link_id_str) {
-            Some(pathway_mappings_for_link) => {
-                if let Some(mapping_info) = pathway_mappings_for_link
-                    .iter()
-                    .find(|m| m.msg_type_id == msg_type_id_to_send)
-                {
-                    match self.pathway_senders.get(&mapping_info.pathway_key_to_use) {
-                        Some(dyn_sender) => {
-                            if dyn_sender.accepts_message_type_id() != msg_type_id_to_send {
-                                return Err(CommsError::InternalInconsistency(format!(
-                                    "Metadata mismatch for link '{}', pathway '{}'. 
-                                    Expected type '{}' for sending, but sender is configured for '{}'.",
-                                    link_id_str,
-                                    mapping_info.pathway_key_to_use.0,
-                                    msg_type_name_to_send,
-                                    dyn_sender.message_type_name()
-                                )));
-                            }
-                            // Pass Box<dyn Any + Send> to send_erased
-                            dyn_sender.send_erased(Box::new(message)).await
-                        }
-                        None => Err(CommsError::PathwayNotFound(format!(
-                            "Internal error: Pathway key '{}' (for type '{}' on link '{}') not found in senders map.",
-                            mapping_info.pathway_key_to_use.0, msg_type_name_to_send, link_id_str
+        let dyn_receiver_box: Box<dyn DynReceiver> = Box::new(ConcreteReceiver { receiver });
+        self.typed_receivers.insert(
+            marker_type_id,
+            (TypeId::of::<Msg>(), Mutex::new(Some(dyn_receiver_box))),
+        );
+
+        Ok(())
+    }
+
+    /// Sends a message on a specified link.
+    pub async fn send<SenderMarker, Msg>(&self, message: Msg) -> Result<(), CommsError>
+    where
+        SenderMarker: Any + Send + Sync + 'static,
+        Msg: ConcreteSenderTrait,
+    {
+        let marker_type_id = TypeId::of::<SenderMarker>();
+        let msg_type_id_to_send = TypeId::of::<Msg>();
+
+        match self.typed_senders.get(&marker_type_id) {
+            Some(dyn_sender) => {
+                if dyn_sender.accepts_message_type_id() != msg_type_id_to_send {
+                    return Err(CommsError::InternalInconsistency(format!(
+                        "Metadata mismatch for link '{}', pathway '{}'.
+                        Expected type '{}' for sending, but sender is configured for '{}'.",
+                        std::any::type_name::<SenderMarker>(),
+                        dyn_sender.message_type_name(),
+                        std::any::type_name::<Msg>(),
+                        dyn_sender.message_type_name()
+                    )));
+                }
+                dyn_sender.send_erased(Box::new(message)).await
+            }
+            None => Err(CommsError::PathwayNotFound(format!(
+                "No pathway configured for marker type '{}' that accepts message type '{}'.
+                Ensure this message type is defined for sending on this link",
+                std::any::type_name::<SenderMarker>(),
+                std::any::type_name::<Msg>()
+            ))),
+        }
+    }
+
+    pub fn take_receiver<ReceiverMarker, Msg>(&self) -> Result<mpsc::Receiver<Msg>, CommsError>
+    where
+        ReceiverMarker: Any + Send + Sync + 'static,
+        Msg: Send + 'static + Debug + Sync,
+    {
+        let marker_type_id = TypeId::of::<ReceiverMarker>();
+        let expected_msg_type_id = TypeId::of::<Msg>();
+
+        match self.typed_receivers.get(&marker_type_id) {
+            Some((reg_type_id, receiver_lock)) => {
+                if *reg_type_id != expected_msg_type_id {
+                    return Err(CommsError::TypeMismatch(format!(
+                        "Expected type '{}' for receiving.",
+                        std::any::type_name::<Msg>(),
+                    )));
+                }
+
+                let mut recv_guard = receiver_lock.lock().map_err(|e| {
+                    CommsError::InternalInconsistency(format!(
+                        "Failed to lock receiver for link '{}' and handle '{}'. Error: {}",
+                        std::any::type_name::<ReceiverMarker>(),
+                        std::any::type_name::<Msg>(),
+                        e
+                    ))
+                })?;
+
+                if let Some(dyn_receiver) = recv_guard.take() {
+                    match dyn_receiver.into_any().downcast::<ConcreteReceiver<Msg>>() {
+                        Ok(concrete_box_recv) => Ok(concrete_box_recv.receiver),
+                        Err(_) => Err(CommsError::InternalInconsistency(format!(
+                            "Critical: Downcast to ConcreteReceiver<{}> failed for key '{}' after TypeId match.",
+                            std::any::type_name::<ReceiverMarker>(),
+                            std::any::type_name::<Msg>()
                         ))),
                     }
                 } else {
-                    Err(CommsError::MessageTypeNotMappedForLink(format!(
-                        "No pathway configured for link '{}' that accepts message type '{}'.
-                        Ensure this message type is defined for sending on this link in `define_links!`.",
-                        link_id_str, msg_type_name_to_send
+                    Err(CommsError::InternalInconsistency(format!(
+                        "Failed to take receiver for link '{}' and handle '{}'.",
+                        std::any::type_name::<ReceiverMarker>(),
+                        std::any::type_name::<Msg>()
                     )))
                 }
             }
-            None => Err(CommsError::LinkNotFound(format!(
-                "Unknown link '{}'. Was it defined and spelled correctly in `define_links!` and Link Enum?",
-                link_id_str
+            None => Err(CommsError::PathwayNotFound(format!(
+                "No receiver for link '{}' and handle '{}' found.",
+                std::any::type_name::<ReceiverMarker>(),
+                std::any::type_name::<Msg>()
             ))),
         }
     }

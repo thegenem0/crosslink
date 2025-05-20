@@ -2,3 +2,4 @@
 target
 .devenv.flake.nix
 .envrc
+crosslink-playground

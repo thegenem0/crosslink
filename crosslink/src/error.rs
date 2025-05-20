@@ -3,6 +3,9 @@ pub enum CommsError {
     #[error("Send failed: {0}")]
     SendFailed(String),
 
+    #[error("Receive failed: {0}")]
+    RecvFailed(String),
+
     #[error("Type mismatch: {0}")]
     TypeMismatch(String),
 

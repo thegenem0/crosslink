@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::error::CommsError;
 
-pub(crate) trait DynSender: Send + Sync + Debug {
+pub trait DynSender: Send + Sync + Debug {
     fn send_erased(
         &self,
         msg: Box<dyn Any + Send>,
@@ -19,16 +19,12 @@ pub(crate) trait DynSender: Send + Sync + Debug {
 
 /// Just a type alias with the required trait bounds.
 /// and a blanket impl for any `T`
-pub(crate) trait ConcreteSenderTrait:
-    Send + Sync + 'static + std::fmt::Debug + Clone
-{
-}
+pub trait ConcreteSenderTrait: Send + Sync + 'static + std::fmt::Debug + Clone {}
 impl<T: Send + Sync + 'static + std::fmt::Debug + Clone> ConcreteSenderTrait for T {}
 
 #[derive(Debug)]
 pub(crate) struct ConcreteSender<T: ConcreteSenderTrait> {
     pub sender: mpsc::Sender<T>,
-    pub _marker: std::marker::PhantomData<T>,
 }
 
 impl<T: ConcreteSenderTrait> DynSender for ConcreteSender<T> {

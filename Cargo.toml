@@ -1,8 +1,9 @@
 [workspace]
 resolver = "2"
-members = [ "crosslink", "crosslink-macros" ]
+members = [ "crosslink", "crosslink-macros"]
 
 [workspace.dependencies]
+crosslink = { path = "crosslink" }
 crosslink-macros = { path = "crosslink-macros" }
 
 tokio = "1.45.0"
